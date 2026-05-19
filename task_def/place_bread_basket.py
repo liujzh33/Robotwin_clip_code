@@ -245,9 +245,11 @@ class PlaceBreadBasketProcessor(BaseTaskProcessor):
     ) -> list[int]:
         left = arm_data["left"]
         right = arm_data["right"]
+        left_gripper = left["gripper"]
+        right_gripper = right["gripper"]
 
         left_c0 = self._find_approach_end_near_close_start(
-            gripper=left["gripper"],
+            gripper=left_gripper,
             z=left["z"],
             joint_velocity=left["joint_vel"],
             start=0,
@@ -255,7 +257,7 @@ class PlaceBreadBasketProcessor(BaseTaskProcessor):
             total_steps=total_steps,
         )
         right_c0 = self._find_approach_end_near_close_start(
-            gripper=right["gripper"],
+            gripper=right_gripper,
             z=right["z"],
             joint_velocity=right["joint_vel"],
             start=0,
@@ -264,41 +266,70 @@ class PlaceBreadBasketProcessor(BaseTaskProcessor):
         )
         c0 = max(left_c0, right_c0)
 
-        left_c1 = self._find_move_start_after_grasp(
-            left["gripper"], left["joint_vel"], left["eef_vel"], c0, total_steps
+        left_close_done = self._first_consecutive_leq(left_gripper, self.close_threshold, c0) or c0
+        right_close_done = self._first_consecutive_leq(right_gripper, self.close_threshold, c0) or c0
+
+        left_move_start = self._find_move_start_after_grasp(
+            left_gripper, left["joint_vel"], left["eef_vel"], left_close_done, total_steps
         )
-        right_c1 = self._find_move_start_after_grasp(
-            right["gripper"], right["joint_vel"], right["eef_vel"], c0, total_steps
+        right_move_start = self._find_move_start_after_grasp(
+            right_gripper, right["joint_vel"], right["eef_vel"], right_close_done, total_steps
         )
 
-        if left_c1 <= right_c1:
+        search_open_start = max(left_close_done, right_close_done)
+        left_open_start = self._find_open_start(left_gripper, search_open_start)
+        right_open_start = self._find_open_start(right_gripper, search_open_start)
+
+        if left_open_start is None and right_open_start is None:
+            if left_move_start <= right_move_start:
+                first_arm, second_arm = "left", "right"
+            else:
+                first_arm, second_arm = "right", "left"
+        elif left_open_start is None:
+            first_arm, second_arm = "right", "left"
+        elif right_open_start is None:
             first_arm, second_arm = "left", "right"
-            first_c1, second_c1 = left_c1, right_c1
+        elif left_open_start <= right_open_start:
+            first_arm, second_arm = "left", "right"
         else:
             first_arm, second_arm = "right", "left"
-            first_c1, second_c1 = right_c1, left_c1
 
-        other_arm = "right" if first_arm == "left" else "left"
-        other_close_done = self._first_consecutive_leq(
-            arm_data[other_arm]["gripper"], self.close_threshold, c0
-        )
-        if other_close_done is None:
-            other_close_done = c0
-        c1 = max(first_c1, other_close_done)
+        self.first_arm = first_arm
+        self.second_arm = second_arm
 
-        first_data = arm_data[first_arm]
-        second_data = arm_data[second_arm]
-        c2 = self._find_place_start_by_gripper_opening(first_data["gripper"], c1, total_steps)
+        if first_arm == "left":
+            first_gripper = left_gripper
+            second_gripper = right_gripper
+            first_move_start = left_move_start
+            other_close_done = right_close_done
+            second_joint_vel = right["joint_vel"]
+            second_eef_vel = right["eef_vel"]
+            second_move_start = right_move_start
+        else:
+            first_gripper = right_gripper
+            second_gripper = left_gripper
+            first_move_start = right_move_start
+            other_close_done = left_close_done
+            second_joint_vel = left["joint_vel"]
+            second_eef_vel = left["eef_vel"]
+            second_move_start = left_move_start
+
+        c1 = max(first_move_start, other_close_done)
+
+        # c2: first bread move ends when first_arm gripper starts opening (not second-arm motion).
+        c2 = self._find_place_start_by_gripper_opening(first_gripper, c1, total_steps)
+
         c3 = self._find_second_move_start_after_first_release(
-            first_gripper=first_data["gripper"],
-            second_gripper=second_data["gripper"],
-            second_joint_vel=second_data["joint_vel"],
-            release_start=c2,
-            search_start=c0,
-            fallback_move_start=second_c1,
+            first_gripper=first_gripper,
+            second_gripper=second_gripper,
+            second_joint_vel=second_joint_vel,
+            second_eef_vel=second_eef_vel,
+            start=c2,
+            fallback_move_start=second_move_start,
             total_steps=total_steps,
         )
-        c4 = self._find_place_start_by_gripper_opening(second_data["gripper"], c3, total_steps)
+
+        c4 = self._find_place_start_by_gripper_opening(second_gripper, c3, total_steps)
         return [c0, c1, c2, c3, c4]
 
     def _pick_place_cycle(
@@ -359,18 +390,21 @@ class PlaceBreadBasketProcessor(BaseTaskProcessor):
         first_gripper: np.ndarray,
         second_gripper: np.ndarray,
         second_joint_vel: np.ndarray,
-        release_start: int,
-        search_start: int,
+        second_eef_vel: Optional[np.ndarray],
+        start: int,
         fallback_move_start: int,
         total_steps: int,
     ) -> int:
-        for idx in range(release_start, total_steps):
-            first_open = first_gripper[idx] >= self.open_done_threshold
-            second_closed = second_gripper[idx] <= self.close_threshold
-            second_moving = second_joint_vel[idx] > self.joint_velocity_threshold
-            if first_open and second_closed and second_moving:
+        for idx in range(start, total_steps):
+            first_release_done = first_gripper[idx] >= self.open_done_threshold
+            second_still_holding = second_gripper[idx] <= self.close_threshold
+            second_move = second_joint_vel[idx] > self.joint_velocity_threshold
+            second_eef_move = (
+                second_eef_vel is not None and second_eef_vel[idx] > self.eef_velocity_threshold
+            )
+            if first_release_done and second_still_holding and (second_move or second_eef_move):
                 return int(idx)
-        return int(max(release_start, fallback_move_start))
+        return int(max(start, fallback_move_start))
 
     def _find_all_arm_grasp_events(self, arm: str, gripper: np.ndarray, total_steps: int) -> list[GraspEvent]:
         events: list[GraspEvent] = []

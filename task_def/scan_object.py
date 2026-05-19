@@ -34,6 +34,15 @@ class ScanObjectProcessor(BaseTaskProcessor):
         z_stable_threshold: float = 0.005,
         stable_window: int = 5,
         stable_velocity_threshold: float = 0.01,
+        min_prev_motion_frames: int = 5,
+        next_move_window: int = 4,
+        motion_lookback: int = 20,
+        plateau_min_gap: int = 3,
+        post_lift_settle: int = 8,
+        min_motion_segment_len: int = 12,
+        max_motion_gap: int = 3,
+        strong_motion_threshold: float = 0.03,
+        min_rotate_duration: int = 20,
     ):
         self.analyzer = TrajectoryAnalyzer(velocity_threshold=joint_velocity_threshold)
         self.close_threshold = close_threshold
@@ -51,6 +60,15 @@ class ScanObjectProcessor(BaseTaskProcessor):
         self.z_stable_threshold = z_stable_threshold
         self.stable_window = stable_window
         self.stable_velocity_threshold = stable_velocity_threshold
+        self.min_prev_motion_frames = min_prev_motion_frames
+        self.next_move_window = next_move_window
+        self.motion_lookback = motion_lookback
+        self.plateau_min_gap = plateau_min_gap
+        self.post_lift_settle = post_lift_settle
+        self.min_motion_segment_len = min_motion_segment_len
+        self.max_motion_gap = max_motion_gap
+        self.strong_motion_threshold = strong_motion_threshold
+        self.min_rotate_duration = min_rotate_duration
         self.object_arm: Optional[str] = None
         self.scanner_arm: Optional[str] = None
 
@@ -135,7 +153,79 @@ class ScanObjectProcessor(BaseTaskProcessor):
             arm_data["right"]["gripper"], arm_data["right"]["z"], c1, total_steps
         )
         lift_ready = max(left_lift_done, right_lift_done)
+        c2, c3 = self._compute_rotate_scan_checkpoints(arm_data, lift_ready, total_steps)
 
+        checkpoints = self._enforce_order([c0, c1, c2, c3], total_steps)
+        return self.validate_checkpoints(checkpoints, total_steps)
+
+    def _compute_rotate_scan_checkpoints(
+        self,
+        arm_data: dict,
+        lift_ready: int,
+        total_steps: int,
+    ) -> tuple[int, int]:
+        """c2/c3 from post-lift motion segments (not single-frame velocity spikes)."""
+        post_lift_start = min(total_steps - 1, lift_ready + self.post_lift_settle)
+
+        all_segments: list[dict] = []
+        for arm in ("left", "right"):
+            for seg in self._find_motion_segments(
+                joint_vel=arm_data[arm]["joint_vel"],
+                eef_vel=arm_data[arm]["eef_vel"],
+                angular_vel=arm_data[arm]["angular_vel"],
+                start=post_lift_start,
+                total_steps=total_steps,
+            ):
+                seg = dict(seg)
+                seg["arm"] = arm
+                all_segments.append(seg)
+        all_segments.sort(key=lambda x: x["start"])
+
+        if len(all_segments) >= 1:
+            c2, c3 = self._checkpoints_from_motion_segments(all_segments)
+            if c3 - c2 < self.min_rotate_duration:
+                later_segments = [
+                    seg
+                    for seg in all_segments
+                    if seg["start"] > c2 and seg["length"] >= self.min_motion_segment_len
+                ]
+                if len(later_segments) >= 2:
+                    c2_retry, c3_retry = self._checkpoints_from_motion_segments(later_segments)
+                    if c3_retry - c2_retry >= self.min_rotate_duration:
+                        c2, c3 = c2_retry, c3_retry
+            return c2, c3
+
+        return self._fallback_rotate_scan_checkpoints(arm_data, lift_ready, total_steps)
+
+    def _checkpoints_from_motion_segments(self, segments: list[dict]) -> tuple[int, int]:
+        object_seg = segments[0]
+        object_arm = object_seg["arm"]
+        scanner_arm = "right" if object_arm == "left" else "left"
+
+        self.object_arm = object_arm
+        self.scanner_arm = scanner_arm
+
+        c2 = object_seg["start"]
+
+        scanner_seg = None
+        for seg in segments[1:]:
+            if seg["arm"] == scanner_arm and seg["start"] >= object_seg["end"] + self.plateau_min_gap:
+                scanner_seg = seg
+                break
+
+        if scanner_seg is not None:
+            c3 = int((object_seg["end"] + scanner_seg["start"]) // 2)
+        else:
+            c3 = int(object_seg["end"])
+
+        return c2, c3
+
+    def _fallback_rotate_scan_checkpoints(
+        self,
+        arm_data: dict,
+        lift_ready: int,
+        total_steps: int,
+    ) -> tuple[int, int]:
         left_rotate_start = self._find_post_lift_motion_start(
             arm_data["left"]["joint_vel"],
             arm_data["left"]["eef_vel"],
@@ -164,19 +254,104 @@ class ScanObjectProcessor(BaseTaskProcessor):
             object_data = arm_data["right"]
             scanner_data = arm_data["left"]
 
-        c3 = self._find_scanner_adjust_start_after_object_rotation(
-            object_joint_vel=object_data["joint_vel"],
-            object_eef_vel=object_data["eef_vel"],
-            scanner_joint_vel=scanner_data["joint_vel"],
-            scanner_eef_vel=scanner_data["eef_vel"],
-            object_angular_vel=object_data["angular_vel"],
-            scanner_angular_vel=scanner_data["angular_vel"],
+        c3 = self._find_boundary_between_two_motion_segments(
+            prev_z=object_data["z"],
+            prev_joint_vel=object_data["joint_vel"],
+            prev_eef_vel=object_data["eef_vel"],
+            next_joint_vel=scanner_data["joint_vel"],
+            next_eef_vel=scanner_data["eef_vel"],
             start=c2,
             total_steps=total_steps,
+            prev_angular_vel=object_data["angular_vel"],
+            next_angular_vel=scanner_data["angular_vel"],
+        )
+        return c2, c3
+
+    def _find_motion_segments(
+        self,
+        joint_vel: np.ndarray,
+        eef_vel: Optional[np.ndarray],
+        angular_vel: Optional[np.ndarray],
+        start: int,
+        total_steps: int,
+    ) -> list[dict]:
+        """Find sustained post-lift motion segments; filter short noise / lift tail."""
+        eef = eef_vel if eef_vel is not None else np.zeros(total_steps, dtype=np.float64)
+        ang = angular_vel if angular_vel is not None else np.zeros(total_steps, dtype=np.float64)
+
+        motion_mask = (
+            (joint_vel[:total_steps] > self.joint_velocity_threshold)
+            | (eef[:total_steps] > self.eef_velocity_threshold)
+            | (ang[:total_steps] > self.angular_velocity_threshold)
         )
 
-        checkpoints = self._enforce_order([c0, c1, c2, c3], total_steps)
-        return self.validate_checkpoints(checkpoints, total_steps)
+        segments: list[dict] = []
+        in_segment = False
+        seg_start: Optional[int] = None
+        last_active: Optional[int] = None
+
+        for t in range(start, total_steps):
+            if motion_mask[t]:
+                if not in_segment:
+                    in_segment = True
+                    seg_start = t
+                last_active = t
+            elif in_segment and last_active is not None:
+                if t - last_active <= self.max_motion_gap:
+                    continue
+
+                seg_end = last_active + 1
+                seg = self._motion_segment_dict(
+                    seg_start, seg_end, joint_vel, eef, ang
+                )
+                if seg is not None:
+                    segments.append(seg)
+
+                in_segment = False
+                seg_start = None
+                last_active = None
+
+        if in_segment and seg_start is not None and last_active is not None:
+            seg_end = last_active + 1
+            seg = self._motion_segment_dict(
+                seg_start, seg_end, joint_vel, eef, ang
+            )
+            if seg is not None:
+                segments.append(seg)
+
+        return segments
+
+    def _motion_segment_dict(
+        self,
+        seg_start: int,
+        seg_end: int,
+        joint_vel: np.ndarray,
+        eef: np.ndarray,
+        ang: np.ndarray,
+    ) -> Optional[dict]:
+        length = seg_end - seg_start
+        joint_peak = float(np.max(joint_vel[seg_start:seg_end]))
+        eef_peak = float(np.max(eef[seg_start:seg_end]))
+        ang_peak = float(np.max(ang[seg_start:seg_end]))
+
+        strong_enough = (
+            joint_peak >= self.strong_motion_threshold
+            or eef_peak >= self.eef_velocity_threshold * 2
+            or ang_peak >= self.angular_velocity_threshold * 2
+        )
+        long_enough = length >= self.min_motion_segment_len
+
+        if not (long_enough and strong_enough):
+            return None
+
+        return {
+            "start": int(seg_start),
+            "end": int(seg_end),
+            "length": int(length),
+            "joint_peak": joint_peak,
+            "eef_peak": eef_peak,
+            "angular_peak": ang_peak,
+        }
 
     def _find_lift_or_move_start_after_grasp(
         self,
@@ -245,43 +420,92 @@ class ScanObjectProcessor(BaseTaskProcessor):
             return int(start + high_candidates[0])
         return int(start)
 
-    def _find_scanner_adjust_start_after_object_rotation(
+    def _find_boundary_between_two_motion_segments(
         self,
-        object_joint_vel: np.ndarray,
-        object_eef_vel: Optional[np.ndarray],
-        scanner_joint_vel: np.ndarray,
-        scanner_eef_vel: Optional[np.ndarray],
-        object_angular_vel: Optional[np.ndarray],
-        scanner_angular_vel: Optional[np.ndarray],
+        prev_z: Optional[np.ndarray],
+        prev_joint_vel: np.ndarray,
+        prev_eef_vel: Optional[np.ndarray],
+        next_joint_vel: np.ndarray,
+        next_eef_vel: Optional[np.ndarray],
         start: int,
         total_steps: int,
+        prev_angular_vel: Optional[np.ndarray] = None,
+        next_angular_vel: Optional[np.ndarray] = None,
     ) -> int:
-        window = max(1, self.stable_window)
-        object_eef = object_eef_vel if object_eef_vel is not None else np.zeros(total_steps, dtype=np.float64)
-        scanner_eef = scanner_eef_vel if scanner_eef_vel is not None else np.zeros(total_steps, dtype=np.float64)
+        """Midpoint of static plateau between prev_arm stop and next_arm start (Rotate -> Scan)."""
+        stable_window = max(1, self.stable_window)
+        next_move_window = max(1, self.next_move_window)
+        search_start = start + max(1, self.min_prev_motion_frames)
 
-        for t in range(start, max(start, total_steps - window)):
-            object_stop = (
-                float(np.max(object_joint_vel[t : t + window])) < self.joint_velocity_threshold
-                and float(np.max(object_eef[t : t + window])) < self.eef_velocity_threshold
+        prev_eef = (
+            prev_eef_vel if prev_eef_vel is not None else np.zeros(total_steps, dtype=np.float64)
+        )
+        next_eef = (
+            next_eef_vel if next_eef_vel is not None else np.zeros(total_steps, dtype=np.float64)
+        )
+
+        prev_stop: Optional[int] = None
+        for t in range(search_start, max(search_start, total_steps - stable_window)):
+            prev_joint_stop = (
+                float(np.max(prev_joint_vel[t : t + stable_window])) <= self.joint_velocity_threshold
             )
-            if object_angular_vel is not None:
-                object_stop = object_stop and (
-                    float(np.max(object_angular_vel[t : t + window])) < self.angular_velocity_threshold
+            prev_eef_stop = float(np.max(prev_eef[t : t + stable_window])) <= self.eef_velocity_threshold
+            prev_stop_ok = prev_joint_stop and prev_eef_stop
+
+            if prev_z is not None:
+                z_slice = np.asarray(prev_z[:total_steps], dtype=np.float64)[t : t + stable_window]
+                prev_z_stable = float(np.max(z_slice) - np.min(z_slice)) <= self.z_stable_threshold
+                prev_stop_ok = prev_stop_ok and prev_z_stable
+
+            if prev_angular_vel is not None:
+                prev_ang_stop = (
+                    float(np.max(prev_angular_vel[t : t + stable_window]))
+                    <= self.angular_velocity_threshold
+                )
+                prev_stop_ok = prev_stop_ok and prev_ang_stop
+
+            lookback_start = max(start, t - self.motion_lookback)
+            prev_had_motion = (
+                float(np.max(prev_joint_vel[lookback_start:t])) > self.joint_velocity_threshold
+                or float(np.max(prev_eef[lookback_start:t])) > self.eef_velocity_threshold
+            )
+            if prev_angular_vel is not None:
+                prev_had_motion = prev_had_motion or (
+                    float(np.max(prev_angular_vel[lookback_start:t])) > self.angular_velocity_threshold
                 )
 
-            scanner_move = float(scanner_joint_vel[t]) > self.joint_velocity_threshold
-            scanner_move = scanner_move or float(scanner_eef[t]) > self.eef_velocity_threshold
-            if scanner_angular_vel is not None:
-                scanner_move = scanner_move or float(scanner_angular_vel[t]) > self.angular_velocity_threshold
+            if prev_stop_ok and prev_had_motion:
+                prev_stop = int(t)
+                break
 
-            if object_stop and scanner_move:
-                return int(t)
+        if prev_stop is None:
+            return int(search_start)
 
-        scanner_hits = np.where(scanner_joint_vel[start:total_steps] > self.joint_velocity_threshold)[0]
-        if len(scanner_hits) > 0:
-            return int(start + scanner_hits[0])
-        return int(start)
+        next_start: Optional[int] = None
+        for t in range(prev_stop + self.plateau_min_gap, max(prev_stop + 1, total_steps - next_move_window)):
+            next_joint_move = (
+                float(np.max(next_joint_vel[t : t + next_move_window])) > self.joint_velocity_threshold
+            )
+            next_eef_move = float(np.max(next_eef[t : t + next_move_window])) > self.eef_velocity_threshold
+            next_move_ok = next_joint_move or next_eef_move
+
+            if next_angular_vel is not None:
+                next_ang_move = (
+                    float(np.max(next_angular_vel[t : t + next_move_window]))
+                    > self.angular_velocity_threshold
+                )
+                next_move_ok = next_move_ok or next_ang_move
+
+            if next_move_ok:
+                next_start = int(t)
+                break
+
+        if next_start is None:
+            return int(prev_stop)
+
+        if next_start - prev_stop >= self.plateau_min_gap:
+            return int((prev_stop + next_start) // 2)
+        return int(prev_stop)
 
     def _find_post_lift_motion_start(
         self,
